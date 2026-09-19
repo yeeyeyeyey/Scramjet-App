@@ -2,11 +2,12 @@ import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "url";
 import { hostname } from "node:os";
-import { server as wisp, logging } from "@mercuryworkshop/wisp-js/server";
+
 import Fastify from "fastify";
 import fastifyStatic from "@fastify/static";
 import { WebSocketServer, WebSocket } from "ws";
 
+import { server as wisp, logging } from "@mercuryworkshop/wisp-js/server";
 import { scramjetPath } from "@mercuryworkshop/scramjet/path";
 import { libcurlPath } from "@mercuryworkshop/libcurl-transport";
 import { baremuxPath } from "@mercuryworkshop/bare-mux/node";
@@ -21,43 +22,47 @@ Object.assign(wisp.options, {
   dns_servers: ["1.1.1.3", "1.0.0.3"],
 });
 
-/* =========================
-   WFATP ONLINE CHAT
-   Public chat + DMs + files
-   ========================= */
+/* =========================================================
+   WFATP CHAT
+   Public chat + DMs + profile pictures + safe file sharing
+   ========================================================= */
 
-const CHAT_HISTORY_LIMIT = 80;
-const CHAT_TEXT_LIMIT = 500;
-const CHAT_AVATAR_LIMIT = 52000;
-const CHAT_FILE_MAX_BYTES = 4 * 1024 * 1024;
-const CHAT_SOCKET_MAX_BYTES = 7 * 1024 * 1024;
+const MAX_FILE_BYTES = 2 * 1024 * 1024; // 2 MB
+const MAX_AVATAR_BYTES = 350 * 1024;
+const MAX_MESSAGE_LENGTH = 750;
+const HISTORY_LIMIT = 100;
 
-const ALLOWED_FILE_MIMES = new Set([
+const ALLOWED_FILE_TYPES = new Set([
   "image/png",
   "image/jpeg",
   "image/webp",
   "image/gif",
-  "application/pdf",
   "text/plain",
+  "application/pdf",
   "audio/mpeg",
   "audio/wav",
   "audio/ogg",
-  "video/mp4",
-  "video/webm",
 ]);
 
 const chatWss = new WebSocketServer({
   noServer: true,
-  maxPayload: CHAT_SOCKET_MAX_BYTES,
+
+  // Slightly above the 2 MB file limit because JSON/base64 adds size.
+  maxPayload: 4 * 1024 * 1024,
 });
 
-const chatClients = new Map();
-const chatHistory = [];
+const clients = new Map();
+const publicHistory = [];
+
+/* --------------------------
+   Cleaning / validation
+   -------------------------- */
 
 function cleanName(value) {
   return (
     String(value || "")
-      .replace(/[\\<>\u0000-\u001f\u007f]/g, "")
+      .replace(/[<>{}\\]/g, "")
+      .replace(/[\u0000-\u001f\u007f]/g, "")
       .replace(/\s+/g, " ")
       .trim()
       .slice(0, 24) || "Guest"
@@ -65,77 +70,98 @@ function cleanName(value) {
 }
 
 function cleanText(value) {
-  let text = String(value || "")
+  return String(value || "")
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
     .trim()
-    .slice(0, CHAT_TEXT_LIMIT);
-
-  text = text.replace(
-    /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi,
-    "[email removed]"
-  );
-
-  text = text.replace(
-    /(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?){2}\d{4}/g,
-    "[phone number removed]"
-  );
-
-  return text;
-}
-
-function cleanAvatar(value) {
-  const avatar = String(value || "");
-
-  if (
-    !/^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/i.test(avatar)
-  ) {
-    return "";
-  }
-
-  return avatar.length <= CHAT_AVATAR_LIMIT ? avatar : "";
+    .slice(0, MAX_MESSAGE_LENGTH);
 }
 
 function cleanFileName(value) {
-  return (
-    String(value || "file")
-      .replace(/[\\/:*?"<>|\u0000-\u001f\u007f]/g, "_")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 80) || "file"
-  );
+  let name = String(value || "file")
+    .replace(/[\/\\:*?"<>|]/g, "_")
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .trim()
+    .slice(0, 80);
+
+  return name || "file";
 }
 
-function parseFileData(dataUrl) {
-  const value = String(dataUrl || "");
-  const match = value.match(
-    /^data:([^;,]+);base64,([A-Za-z0-9+/=]+)$/i
+function estimateBase64Bytes(base64) {
+  const clean = String(base64 || "").replace(/\s/g, "");
+
+  if (!clean) return 0;
+
+  let padding = 0;
+
+  if (clean.endsWith("==")) padding = 2;
+  else if (clean.endsWith("=")) padding = 1;
+
+  return Math.floor((clean.length * 3) / 4) - padding;
+}
+
+function cleanAvatar(value) {
+  const data = String(value || "");
+
+  const match = data.match(
+    /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/i
   );
 
-  if (!match) return null;
+  if (!match) return "";
 
-  const mime = String(match[1] || "").toLowerCase();
-  const base64 = match[2] || "";
+  const bytes = estimateBase64Bytes(match[2]);
 
-  if (!ALLOWED_FILE_MIMES.has(mime)) return null;
+  if (bytes <= 0 || bytes > MAX_AVATAR_BYTES) {
+    return "";
+  }
 
-  let size = 0;
+  return data;
+}
 
-  try {
-    size = Buffer.byteLength(base64, "base64");
-  } catch {
+function cleanFile(file) {
+  if (!file || typeof file !== "object") {
     return null;
   }
 
-  if (!size || size > CHAT_FILE_MAX_BYTES) return null;
+  const name = cleanFileName(file.name);
+  const type = String(file.type || "").toLowerCase().trim();
+  const data = String(file.data || "");
+
+  if (!ALLOWED_FILE_TYPES.has(type)) {
+    return null;
+  }
+
+  const escapedType = type.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  const pattern = new RegExp(
+    "^data:" + escapedType + ";base64,([A-Za-z0-9+/=]+)$",
+    "i"
+  );
+
+  const match = data.match(pattern);
+
+  if (!match) {
+    return null;
+  }
+
+  const size = estimateBase64Bytes(match[1]);
+
+  if (size <= 0 || size > MAX_FILE_BYTES) {
+    return null;
+  }
 
   return {
-    mime,
+    name,
+    type,
     size,
-    data: `data:${mime};base64,${base64}`,
+    data,
   };
 }
 
-function sendJson(ws, packet) {
+/* --------------------------
+   Socket helpers
+   -------------------------- */
+
+function send(ws, packet) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
   try {
@@ -143,31 +169,20 @@ function sendJson(ws, packet) {
   } catch {}
 }
 
-function broadcast(packet) {
-  const payload = JSON.stringify(packet);
+function broadcast(packet, except = null) {
+  const json = JSON.stringify(packet);
 
-  for (const ws of chatClients.keys()) {
-    if (ws.readyState === WebSocket.OPEN) {
-      try {
-        ws.send(payload);
-      } catch {}
-    }
+  for (const ws of clients.keys()) {
+    if (ws === except) continue;
+    if (ws.readyState !== WebSocket.OPEN) continue;
+
+    try {
+      ws.send(json);
+    } catch {}
   }
 }
 
-function getClientById(id) {
-  const wanted = String(id || "");
-
-  for (const [ws, client] of chatClients.entries()) {
-    if (client.id === wanted) {
-      return { ws, client };
-    }
-  }
-
-  return null;
-}
-
-function publicClient(client) {
+function getPublicUser(client) {
   return {
     id: client.id,
     name: client.name,
@@ -176,56 +191,53 @@ function publicClient(client) {
 }
 
 function getOnlineUsers() {
-  return Array.from(chatClients.values()).map(publicClient);
+  return [...clients.values()].map(getPublicUser);
 }
 
-function broadcastPresence() {
+function broadcastUsers() {
   broadcast({
-    type: "presence",
-    online: chatClients.size,
+    type: "users",
     users: getOnlineUsers(),
+    online: clients.size,
   });
 }
 
-function canSendText(client) {
+function findSocketById(id) {
+  const wanted = String(id || "");
+
+  for (const [ws, client] of clients.entries()) {
+    if (client.id === wanted) {
+      return ws;
+    }
+  }
+
+  return null;
+}
+
+function canSend(client) {
   const now = Date.now();
 
-  client.recentMessages = client.recentMessages.filter(
+  client.sendTimes = client.sendTimes.filter(
     (time) => now - time < 10000
   );
 
-  if (
-    now - client.lastMessageAt < 550 ||
-    client.recentMessages.length >= 8
-  ) {
+  if (now - client.lastMessageAt < 400) {
+    return false;
+  }
+
+  if (client.sendTimes.length >= 10) {
     return false;
   }
 
   client.lastMessageAt = now;
-  client.recentMessages.push(now);
+  client.sendTimes.push(now);
 
   return true;
 }
 
-function canSendFile(client) {
-  const now = Date.now();
-
-  client.recentFiles = client.recentFiles.filter(
-    (time) => now - time < 60000
-  );
-
-  if (
-    now - client.lastFileAt < 4000 ||
-    client.recentFiles.length >= 4
-  ) {
-    return false;
-  }
-
-  client.lastFileAt = now;
-  client.recentFiles.push(now);
-
-  return true;
-}
+/* --------------------------
+   Chat WebSocket
+   -------------------------- */
 
 chatWss.on("connection", (ws) => {
   const client = {
@@ -233,38 +245,34 @@ chatWss.on("connection", (ws) => {
     name: "Guest",
     avatar: "",
     lastMessageAt: 0,
-    recentMessages: [],
-    lastFileAt: 0,
-    recentFiles: [],
+    sendTimes: [],
   };
 
-  chatClients.set(ws, client);
+  clients.set(ws, client);
 
-  sendJson(ws, {
+  send(ws, {
     type: "hello",
     id: client.id,
-    history: chatHistory,
-    online: chatClients.size,
+    history: publicHistory,
     users: getOnlineUsers(),
-
-    limits: {
-      text: CHAT_TEXT_LIMIT,
-      fileBytes: CHAT_FILE_MAX_BYTES,
-    },
+    online: clients.size,
   });
 
-  broadcastPresence();
+  broadcastUsers();
 
   ws.on("message", (raw, isBinary) => {
-    if (isBinary || raw.length > CHAT_SOCKET_MAX_BYTES) {
-      return;
-    }
+    if (isBinary) return;
 
     let packet;
 
     try {
       packet = JSON.parse(raw.toString("utf8"));
     } catch {
+      send(ws, {
+        type: "error",
+        message: "Invalid chat packet.",
+      });
+
       return;
     }
 
@@ -272,13 +280,18 @@ chatWss.on("connection", (ws) => {
       return;
     }
 
-    /* PROFILE */
+    /* =========================
+       PROFILE
+       ========================= */
 
     if (packet.type === "profile") {
       client.name = cleanName(packet.name);
-      client.avatar = cleanAvatar(packet.avatar);
 
-      sendJson(ws, {
+      if (packet.avatar !== undefined) {
+        client.avatar = cleanAvatar(packet.avatar);
+      }
+
+      send(ws, {
         type: "profile",
         ok: true,
         id: client.id,
@@ -286,18 +299,17 @@ chatWss.on("connection", (ws) => {
         avatar: client.avatar,
       });
 
-      broadcastPresence();
+      broadcastUsers();
       return;
     }
 
-    /* PUBLIC MESSAGE / DM */
+    /* =========================
+       PUBLIC MESSAGE
+       ========================= */
 
-    if (
-      packet.type === "message" ||
-      packet.type === "dm"
-    ) {
-      if (!canSendText(client)) {
-        sendJson(ws, {
+    if (packet.type === "message") {
+      if (!canSend(client)) {
+        send(ws, {
           type: "error",
           message: "You're sending messages too quickly.",
         });
@@ -306,352 +318,339 @@ chatWss.on("connection", (ws) => {
       }
 
       const text = cleanText(packet.text);
+      const file = packet.file ? cleanFile(packet.file) : null;
 
-      if (!text) {
-        return;
-      }
-
-      const isDm =
-        packet.type === "dm" ||
-        packet.scope === "dm";
-
-      const now = Date.now();
-
-      if (isDm) {
-        const target = getClientById(packet.to);
-
-        if (!target) {
-          sendJson(ws, {
-            type: "error",
-            message: "That user is no longer online.",
-          });
-
-          return;
-        }
-
-        const message = {
-          type: "message",
-          scope: "dm",
-
-          id: client.id,
-          from: client.id,
-          to: target.client.id,
-
-          name: client.name,
-          avatar: client.avatar,
-
-          text,
-          time: now,
-        };
-
-        sendJson(ws, message);
-
-        if (target.ws !== ws) {
-          sendJson(target.ws, message);
-        }
+      if (packet.file && !file) {
+        send(ws, {
+          type: "error",
+          message:
+            "That file isn't supported or is larger than 2 MB.",
+        });
 
         return;
       }
+
+      if (!text && !file) return;
 
       const message = {
         type: "message",
-        scope: "public",
+        messageId: randomUUID(),
 
-        id: client.id,
-        name: client.name,
-        avatar: client.avatar,
+        sender: {
+          id: client.id,
+          name: client.name,
+          avatar: client.avatar,
+        },
 
         text,
-        time: now,
+        file,
+        time: Date.now(),
       };
 
-      chatHistory.push(message);
+      /*
+        Don't permanently hold file data in server memory.
+        Normal text messages go into recent history.
+      */
 
-      if (chatHistory.length > CHAT_HISTORY_LIMIT) {
-        chatHistory.splice(
-          0,
-          chatHistory.length - CHAT_HISTORY_LIMIT
-        );
+      if (!file) {
+        publicHistory.push(message);
+
+        if (publicHistory.length > HISTORY_LIMIT) {
+          publicHistory.splice(
+            0,
+            publicHistory.length - HISTORY_LIMIT
+          );
+        }
       }
 
       broadcast(message);
       return;
     }
 
-    /* FILE SHARING */
+    /* =========================
+       DIRECT MESSAGE
+       ========================= */
 
-    if (packet.type === "file") {
-      if (!canSendFile(client)) {
-        sendJson(ws, {
+    if (packet.type === "dm") {
+      if (!canSend(client)) {
+        send(ws, {
           type: "error",
-          message: "You're sending files too quickly.",
+          message: "You're sending messages too quickly.",
         });
 
         return;
       }
 
-      const parsed = parseFileData(packet.data);
+      const targetId = String(packet.to || "");
+      const targetSocket = findSocketById(targetId);
 
-      if (!parsed) {
-        sendJson(ws, {
+      if (!targetSocket) {
+        send(ws, {
+          type: "error",
+          message: "That user is no longer online.",
+        });
+
+        return;
+      }
+
+      const targetClient = clients.get(targetSocket);
+
+      const text = cleanText(packet.text);
+      const file = packet.file ? cleanFile(packet.file) : null;
+
+      if (packet.file && !file) {
+        send(ws, {
           type: "error",
           message:
-            "That file type is not allowed or the file is over 4 MB.",
+            "That file isn't supported or is larger than 2 MB.",
         });
 
         return;
       }
 
-      const isDm =
-        packet.scope === "dm" ||
-        Boolean(packet.to);
+      if (!text && !file) return;
 
-      const now = Date.now();
+      const dm = {
+        type: "dm",
+        messageId: randomUUID(),
 
-      const fileMessage = {
-        type: "file",
-        scope: isDm ? "dm" : "public",
-
-        id: client.id,
-        from: client.id,
-
-        name: client.name,
-        avatar: client.avatar,
-
-        time: now,
-
-        file: {
-          name: cleanFileName(packet.name),
-          mime: parsed.mime,
-          size: parsed.size,
-          data: parsed.data,
+        from: {
+          id: client.id,
+          name: client.name,
+          avatar: client.avatar,
         },
+
+        to: {
+          id: targetClient.id,
+          name: targetClient.name,
+          avatar: targetClient.avatar,
+        },
+
+        text,
+        file,
+        time: Date.now(),
       };
 
-      if (isDm) {
-        const target = getClientById(packet.to);
-
-        if (!target) {
-          sendJson(ws, {
-            type: "error",
-            message: "That user is no longer online.",
-          });
-
-          return;
-        }
-
-        fileMessage.to = target.client.id;
-
-        sendJson(ws, fileMessage);
-
-        if (target.ws !== ws) {
-          sendJson(target.ws, fileMessage);
-        }
-
-        return;
-      }
-
       /*
-        Files are live-only.
-        They are NOT stored in history so Railway memory
-        doesn't get filled with base64 files.
+        Send DM only to sender + receiver.
+        Nobody else receives it.
       */
 
-      broadcast(fileMessage);
+      send(targetSocket, dm);
+
+      if (targetSocket !== ws) {
+        send(ws, dm);
+      }
+
+      return;
+    }
+
+    /* =========================
+       USER LIST REQUEST
+       ========================= */
+
+    if (packet.type === "get-users") {
+      send(ws, {
+        type: "users",
+        users: getOnlineUsers(),
+        online: clients.size,
+      });
+
       return;
     }
   });
 
   ws.on("close", () => {
-    chatClients.delete(ws);
-    broadcastPresence();
+    clients.delete(ws);
+    broadcastUsers();
   });
 
   ws.on("error", () => {});
 });
 
-/* =========================
+/* =========================================================
    FASTIFY + SCRAMJET
-   ========================= */
+   ========================================================= */
 
 const fastify = Fastify({
   serverFactory: (handler) => {
-    return createServer()
+    const server = createServer();
 
-      .on("request", (req, res) => {
-        res.setHeader(
-          "Cross-Origin-Opener-Policy",
-          "same-origin"
+    server.on("request", (req, res) => {
+      res.setHeader(
+        "Cross-Origin-Opener-Policy",
+        "same-origin"
+      );
+
+      res.setHeader(
+        "Cross-Origin-Embedder-Policy",
+        "require-corp"
+      );
+
+      handler(req, res);
+    });
+
+    server.on("upgrade", (req, socket, head) => {
+      let pathname = "";
+
+      try {
+        pathname = new URL(
+          req.url || "/",
+          "http://localhost"
+        ).pathname;
+      } catch {}
+
+      /* Scramjet / Wisp */
+
+      if (
+        pathname === "/wisp/" ||
+        pathname.endsWith("/wisp/")
+      ) {
+        wisp.routeRequest(req, socket, head);
+        return;
+      }
+
+      /* WFATP chat */
+
+      if (
+        pathname === "/chat" ||
+        pathname === "/chat/"
+      ) {
+        chatWss.handleUpgrade(
+          req,
+          socket,
+          head,
+          (ws) => {
+            chatWss.emit("connection", ws, req);
+          }
         );
 
-        res.setHeader(
-          "Cross-Origin-Embedder-Policy",
-          "require-corp"
-        );
+        return;
+      }
 
-        handler(req, res);
-      })
+      socket.destroy();
+    });
 
-      .on("upgrade", (req, socket, head) => {
-        let pathname = "";
-
-        try {
-          pathname = new URL(
-            req.url || "/",
-            "http://localhost"
-          ).pathname;
-        } catch {}
-
-        if (
-          pathname === "/wisp/" ||
-          pathname.endsWith("/wisp/")
-        ) {
-          wisp.routeRequest(
-            req,
-            socket,
-            head
-          );
-
-          return;
-        }
-
-        if (pathname === "/chat") {
-          chatWss.handleUpgrade(
-            req,
-            socket,
-            head,
-            (ws) => {
-              chatWss.emit(
-                "connection",
-                ws,
-                req
-              );
-            }
-          );
-
-          return;
-        }
-
-        socket.end();
-      });
+    return server;
   },
 });
 
-fastify.register(
-  fastifyStatic,
-  {
-    root: publicPath,
-    decorateReply: true,
-  }
-);
+/* =========================================================
+   STATIC FILES
+   ========================================================= */
 
-fastify.register(
-  fastifyStatic,
-  {
-    root: scramjetPath,
-    prefix: "/scram/",
-    decorateReply: false,
-  }
-);
+fastify.register(fastifyStatic, {
+  root: publicPath,
+  decorateReply: true,
+});
 
-fastify.register(
-  fastifyStatic,
-  {
-    root: libcurlPath,
-    prefix: "/libcurl/",
-    decorateReply: false,
-  }
-);
+fastify.register(fastifyStatic, {
+  root: scramjetPath,
+  prefix: "/scram/",
+  decorateReply: false,
+});
 
-fastify.register(
-  fastifyStatic,
-  {
-    root: baremuxPath,
-    prefix: "/baremux/",
-    decorateReply: false,
-  }
-);
+fastify.register(fastifyStatic, {
+  root: libcurlPath,
+  prefix: "/libcurl/",
+  decorateReply: false,
+});
 
-fastify.get(
-  "/chat/status",
-  async () => ({
+fastify.register(fastifyStatic, {
+  root: baremuxPath,
+  prefix: "/baremux/",
+  decorateReply: false,
+});
+
+/* =========================================================
+   CHAT STATUS
+   ========================================================= */
+
+fastify.get("/chat/status", async () => {
+  return {
     ok: true,
-
-    online: chatClients.size,
-    history: chatHistory.length,
-
-    users: getOnlineUsers().map(
-      (user) => ({
-        id: user.id,
-        name: user.name,
-      })
-    ),
+    online: clients.size,
+    history: publicHistory.length,
 
     features: {
-      dms: true,
-      files: true,
-      maxFileBytes: CHAT_FILE_MAX_BYTES,
+      publicChat: true,
+      directMessages: true,
+      profiles: true,
+      avatars: true,
+      fileSharing: true,
     },
-  })
-);
 
-fastify.setNotFoundHandler(
-  (res, reply) => {
-    return reply
-      .code(404)
-      .type("text/html")
-      .sendFile("404.html");
-  }
-);
+    maxFileSize: MAX_FILE_BYTES,
+  };
+});
 
-fastify.server.on(
-  "listening",
-  () => {
-    const address =
-      fastify.server.address();
+/* =========================================================
+   404
+   ========================================================= */
 
-    console.log("Listening on:");
+fastify.setNotFoundHandler((req, reply) => {
+  return reply
+    .code(404)
+    .type("text/html")
+    .sendFile("404.html");
+});
 
-    console.log(
-      `\thttp://localhost:${address.port}`
-    );
+/* =========================================================
+   START SERVER
+   ========================================================= */
 
-    console.log(
-      `\thttp://${hostname()}:${address.port}`
-    );
+fastify.server.on("listening", () => {
+  const address = fastify.server.address();
 
-    console.log(
-      `\thttp://${
-        address.family === "IPv6"
-          ? `[${address.address}]`
-          : address.address
-      }:${address.port}`
-    );
-  }
-);
+  console.log("Listening on:");
+
+  console.log(
+    `\thttp://localhost:${address.port}`
+  );
+
+  console.log(
+    `\thttp://${hostname()}:${address.port}`
+  );
+
+  console.log(
+    `\thttp://${
+      address.family === "IPv6"
+        ? `[${address.address}]`
+        : address.address
+    }:${address.port}`
+  );
+
+  console.log("WFATP chat enabled.");
+});
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
 function shutdown() {
-  console.log(
-    "SIGTERM signal received: closing HTTP server"
-  );
+  console.log("Closing WFATP server...");
+
+  for (const ws of clients.keys()) {
+    try {
+      ws.close();
+    } catch {}
+  }
 
   try {
     chatWss.close();
   } catch {}
 
-  fastify.close();
-
-  process.exit(0);
+  fastify.close().finally(() => {
+    process.exit(0);
+  });
 }
 
-let port = parseInt(
-  process.env.PORT || ""
-);
+/* =========================================================
+   PORT
+   ========================================================= */
 
-if (isNaN(port)) {
+let port = parseInt(process.env.PORT || "", 10);
+
+if (Number.isNaN(port)) {
   port = 8080;
 }
 
