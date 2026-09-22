@@ -14,28 +14,25 @@ import { baremuxPath } from "@mercuryworkshop/bare-mux/node";
 const publicPath = fileURLToPath(new URL("../public/", import.meta.url));
 
 logging.set_level(logging.NONE);
+
 Object.assign(wisp.options, {
   allow_udp_streams: false,
   hostname_blacklist: [/example\.com/],
   dns_servers: ["1.1.1.3", "1.0.0.3"],
 });
 
-/* =========================
-   WFATP CHAT — public room + live DMs + small-file sharing
-   ========================= */
+/* =========================================================
+   WFATP CHAT
+   Public chat + live DMs + small-file sharing
+   ========================================================= */
 
-const MAX_CHAT_PAYLOAD = 1.5 * 1024 * 1024;
-const chatWss = new WebSocketServer({
-  noServer: true,
-  maxPayload: MAX_CHAT_PAYLOAD,
-});
-
-const chatClients = new Map();
-const chatHistory = [];
+const MAX_SOCKET_PAYLOAD = 2 * 1024 * 1024;
+const MAX_FILE_BYTES = 1024 * 1024;
+const MAX_MESSAGE_LENGTH = 500;
+const MAX_NAME_LENGTH = 24;
+const MAX_AVATAR_LENGTH = 70000;
+const MAX_FILE_NAME_LENGTH = 80;
 const CHAT_HISTORY_LIMIT = 80;
-const CHAT_TEXT_LIMIT = 500;
-const CHAT_AVATAR_LIMIT = 52000;
-const CHAT_FILE_DATA_LIMIT = 1_050_000;
 
 const ALLOWED_FILE_TYPES = new Set([
   "image/png",
@@ -46,19 +43,36 @@ const ALLOWED_FILE_TYPES = new Set([
   "application/pdf",
 ]);
 
+const chatWss = new WebSocketServer({
+  noServer: true,
+  maxPayload: MAX_SOCKET_PAYLOAD,
+});
+
+const chatClients = new Map();
+const chatHistory = [];
+
+/* =========================================================
+   CHAT HELPERS
+   ========================================================= */
+
 function cleanName(value) {
-  return String(value || "")
-    .replace(/[\\<>\u0000-\u001f\u007f]/g, "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 24) || "Guest";
+  return (
+    String(value || "")
+      .replace(/[\\<>\u0000-\u001f\u007f]/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, MAX_NAME_LENGTH) || "Guest"
+  );
 }
 
 function cleanText(value) {
   let text = String(value || "")
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
+    .replace(
+      /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g,
+      ""
+    )
     .trim()
-    .slice(0, CHAT_TEXT_LIMIT);
+    .slice(0, MAX_MESSAGE_LENGTH);
 
   text = text.replace(
     /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi,
@@ -77,44 +91,86 @@ function cleanAvatar(value) {
   const avatar = String(value || "");
 
   if (
-    !/^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/i.test(avatar)
+    !/^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/i.test(
+      avatar
+    )
   ) {
     return "";
   }
 
-  return avatar.length <= CHAT_AVATAR_LIMIT ? avatar : "";
+  if (avatar.length > MAX_AVATAR_LENGTH) {
+    return "";
+  }
+
+  return avatar;
 }
 
 function cleanFileName(value) {
-  return String(value || "file")
-    .replace(/[\\/\u0000-\u001f\u007f]/g, "_")
-    .trim()
-    .slice(0, 80) || "file";
+  return (
+    String(value || "file")
+      .replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_")
+      .trim()
+      .slice(0, MAX_FILE_NAME_LENGTH) || "file"
+  );
 }
 
-function cleanAttachment(value) {
-  if (!value || typeof value !== "object") return null;
+function estimateBase64Bytes(base64) {
+  const clean = String(base64 || "").replace(/\s/g, "");
 
-  const type = String(value.type || "").toLowerCase();
-  const data = String(value.data || "");
+  if (!clean) return 0;
 
-  if (!ALLOWED_FILE_TYPES.has(type)) return null;
-  if (!data.startsWith(`data:${type};base64,`)) return null;
-  if (data.length > CHAT_FILE_DATA_LIMIT) return null;
+  let padding = 0;
 
-  if (!/^[A-Za-z0-9+/=]+$/.test(data.slice(data.indexOf(",") + 1))) {
+  if (clean.endsWith("==")) padding = 2;
+  else if (clean.endsWith("=")) padding = 1;
+
+  return Math.floor((clean.length * 3) / 4) - padding;
+}
+
+function cleanFile(file) {
+  if (!file || typeof file !== "object") {
+    return null;
+  }
+
+  const name = cleanFileName(file.name);
+  const mime = String(file.mime || "").toLowerCase().trim();
+  const data = String(file.data || "");
+
+  if (!ALLOWED_FILE_TYPES.has(mime)) {
+    return null;
+  }
+
+  const escapedMime = mime.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  const match = data.match(
+    new RegExp(
+      `^data:${escapedMime};base64,([A-Za-z0-9+/=]+)$`,
+      "i"
+    )
+  );
+
+  if (!match) {
+    return null;
+  }
+
+  const bytes = estimateBase64Bytes(match[1]);
+
+  if (!bytes || bytes > MAX_FILE_BYTES) {
     return null;
   }
 
   return {
-    name: cleanFileName(value.name),
-    type,
+    name,
+    mime,
     data,
+    size: bytes,
   };
 }
 
 function sendJson(ws, packet) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return;
+  }
 
   try {
     ws.send(JSON.stringify(packet));
@@ -133,29 +189,77 @@ function broadcast(packet) {
   }
 }
 
-function publicUsers() {
-  return Array.from(chatClients.values()).map((client) => ({
+function publicClientInfo(client) {
+  return {
     id: client.id,
     name: client.name,
     avatar: client.avatar,
-  }));
+  };
+}
+
+function onlineUsers() {
+  return Array.from(chatClients.values()).map(publicClientInfo);
 }
 
 function broadcastPresence() {
   broadcast({
     type: "presence",
     online: chatClients.size,
-    users: publicUsers(),
+    users: onlineUsers(),
   });
 }
 
-function findSocketByClientId(id) {
+function findSocketById(id) {
+  const wanted = String(id || "");
+
   for (const [ws, client] of chatClients.entries()) {
-    if (client.id === id) return ws;
+    if (client.id === wanted) {
+      return {
+        ws,
+        client,
+      };
+    }
   }
 
   return null;
 }
+
+function canSend(client) {
+  const now = Date.now();
+
+  client.recentMessages =
+    client.recentMessages.filter(
+      (time) => now - time < 10000
+    );
+
+  if (now - client.lastMessageAt < 500) {
+    return false;
+  }
+
+  if (client.recentMessages.length >= 10) {
+    return false;
+  }
+
+  client.lastMessageAt = now;
+  client.recentMessages.push(now);
+
+  return true;
+}
+
+function addPublicHistory(packet) {
+  chatHistory.push(packet);
+
+  if (chatHistory.length > CHAT_HISTORY_LIMIT) {
+    chatHistory.splice(
+      0,
+      chatHistory.length - CHAT_HISTORY_LIMIT
+    );
+  }
+}
+
+/* =========================================================
+   CHAT SOCKET
+   ========================================================= */
 
 chatWss.on("connection", (ws) => {
   const client = {
@@ -171,15 +275,32 @@ chatWss.on("connection", (ws) => {
   sendJson(ws, {
     type: "hello",
     id: client.id,
+    profile: publicClientInfo(client),
     history: chatHistory,
     online: chatClients.size,
-    users: publicUsers(),
+    users: onlineUsers(),
+    limits: {
+      messageLength: MAX_MESSAGE_LENGTH,
+      fileBytes: MAX_FILE_BYTES,
+      fileTypes: Array.from(ALLOWED_FILE_TYPES),
+    },
   });
 
   broadcastPresence();
 
   ws.on("message", (raw, isBinary) => {
-    if (isBinary || raw.length > MAX_CHAT_PAYLOAD) return;
+    if (isBinary) {
+      return;
+    }
+
+    if (raw.length > MAX_SOCKET_PAYLOAD) {
+      sendJson(ws, {
+        type: "error",
+        message: "That upload is too large.",
+      });
+
+      return;
+    }
 
     let packet;
 
@@ -189,7 +310,13 @@ chatWss.on("connection", (ws) => {
       return;
     }
 
-    if (!packet || typeof packet !== "object") return;
+    if (!packet || typeof packet !== "object") {
+      return;
+    }
+
+    /* -------------------------
+       PROFILE
+       ------------------------- */
 
     if (packet.type === "profile") {
       client.name = cleanName(packet.name);
@@ -198,100 +325,191 @@ chatWss.on("connection", (ws) => {
       sendJson(ws, {
         type: "profile",
         ok: true,
-        name: client.name,
+        profile: publicClientInfo(client),
       });
 
       broadcastPresence();
       return;
     }
 
-    if (packet.type !== "message") return;
+    /* -------------------------
+       PUBLIC MESSAGE
+       ------------------------- */
 
-    const now = Date.now();
-
-    client.recentMessages = client.recentMessages.filter(
-      (time) => now - time < 10000
-    );
-
-    if (
-      now - client.lastMessageAt < 550 ||
-      client.recentMessages.length >= 8
-    ) {
-      sendJson(ws, {
-        type: "error",
-        message: "You're sending messages too quickly.",
-      });
-      return;
-    }
-
-    const text = cleanText(packet.text);
-    const attachment = cleanAttachment(packet.attachment);
-
-    if (!text && !attachment) {
-      if (packet.attachment) {
+    if (packet.type === "message") {
+      if (!canSend(client)) {
         sendJson(ws, {
           type: "error",
-          message: "That file type or size is not allowed.",
+          message: "You're sending messages too quickly.",
         });
-      }
-      return;
-    }
 
-    client.lastMessageAt = now;
-    client.recentMessages.push(now);
-
-    const to = String(packet.to || "").trim();
-
-    const message = {
-      type: "message",
-      scope: to ? "dm" : "general",
-      id: client.id,
-      name: client.name,
-      avatar: client.avatar,
-      text,
-      time: now,
-      ...(attachment ? { attachment } : {}),
-      ...(to ? { to } : {}),
-    };
-
-    if (to) {
-      if (to === client.id) {
-        sendJson(ws, {
-          type: "error",
-          message: "You can't DM yourself.",
-        });
         return;
       }
 
-      const targetWs = findSocketByClientId(to);
+      const text = cleanText(packet.text);
 
-      if (!targetWs || targetWs.readyState !== WebSocket.OPEN) {
+      if (!text) {
+        return;
+      }
+
+      const message = {
+        type: "message",
+        messageId: randomUUID(),
+        user: publicClientInfo(client),
+        text,
+        time: Date.now(),
+      };
+
+      addPublicHistory(message);
+      broadcast(message);
+
+      return;
+    }
+
+    /* -------------------------
+       DIRECT MESSAGE
+       ------------------------- */
+
+    if (packet.type === "dm") {
+      if (!canSend(client)) {
+        sendJson(ws, {
+          type: "error",
+          message: "You're sending messages too quickly.",
+        });
+
+        return;
+      }
+
+      const target = findSocketById(packet.to);
+      const text = cleanText(packet.text);
+
+      if (!target) {
         sendJson(ws, {
           type: "error",
           message: "That user is no longer online.",
         });
+
         return;
       }
 
-      // Private messages go only to their recipient and sender.
-      sendJson(targetWs, message);
-      sendJson(ws, message);
+      if (!text) {
+        return;
+      }
+
+      const dm = {
+        type: "dm",
+        messageId: randomUUID(),
+
+        from: publicClientInfo(client),
+        to: publicClientInfo(target.client),
+
+        text,
+        time: Date.now(),
+      };
+
+      sendJson(target.ws, dm);
+
+      if (target.ws !== ws) {
+        sendJson(ws, dm);
+      }
+
       return;
     }
 
-    // Public text history only. Files and DMs are live-only.
-    if (!attachment) {
-      chatHistory.push(message);
+    /* -------------------------
+       FILE
+       Can be public or DM
+       ------------------------- */
 
-      if (chatHistory.length > CHAT_HISTORY_LIMIT) {
-        chatHistory.splice(
-          0,
-          chatHistory.length - CHAT_HISTORY_LIMIT
-        );
+    if (packet.type === "file") {
+      if (!canSend(client)) {
+        sendJson(ws, {
+          type: "error",
+          message: "You're sending files too quickly.",
+        });
+
+        return;
       }
+
+      const file = cleanFile(packet.file);
+
+      if (!file) {
+        sendJson(ws, {
+          type: "error",
+          message:
+            "That file isn't supported. Use PNG, JPG, WEBP, GIF, TXT, or PDF under 1 MB.",
+        });
+
+        return;
+      }
+
+      const targetId = String(packet.to || "").trim();
+
+      const filePacket = {
+        type: targetId ? "dm-file" : "file",
+        messageId: randomUUID(),
+        from: publicClientInfo(client),
+        file,
+        time: Date.now(),
+      };
+
+      /* DM FILE */
+
+      if (targetId) {
+        const target = findSocketById(targetId);
+
+        if (!target) {
+          sendJson(ws, {
+            type: "error",
+            message: "That user is no longer online.",
+          });
+
+          return;
+        }
+
+        filePacket.to =
+          publicClientInfo(target.client);
+
+        sendJson(target.ws, filePacket);
+
+        if (target.ws !== ws) {
+          sendJson(ws, filePacket);
+        }
+
+        return;
+      }
+
+      /* PUBLIC FILE */
+
+      broadcast(filePacket);
+
+      return;
     }
 
-    broadcast(message);
+    /* -------------------------
+       USER LIST REFRESH
+       ------------------------- */
+
+    if (packet.type === "users") {
+      sendJson(ws, {
+        type: "presence",
+        online: chatClients.size,
+        users: onlineUsers(),
+      });
+
+      return;
+    }
+
+    /* -------------------------
+       PING
+       ------------------------- */
+
+    if (packet.type === "ping") {
+      sendJson(ws, {
+        type: "pong",
+        time: Date.now(),
+      });
+    }
   });
 
   ws.on("close", () => {
@@ -302,18 +520,27 @@ chatWss.on("connection", (ws) => {
   ws.on("error", () => {});
 });
 
-/* =========================
+/* =========================================================
    FASTIFY + SCRAMJET
-   ========================= */
+   ========================================================= */
 
 const fastify = Fastify({
   serverFactory: (handler) => {
     return createServer()
       .on("request", (req, res) => {
-        res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
-        res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+        res.setHeader(
+          "Cross-Origin-Opener-Policy",
+          "same-origin"
+        );
+
+        res.setHeader(
+          "Cross-Origin-Embedder-Policy",
+          "require-corp"
+        );
+
         handler(req, res);
       })
+
       .on("upgrade", (req, socket, head) => {
         let pathname = "";
 
@@ -324,6 +551,8 @@ const fastify = Fastify({
           ).pathname;
         } catch {}
 
+        /* WISP */
+
         if (
           pathname === "/wisp/" ||
           pathname.endsWith("/wisp/")
@@ -332,17 +561,36 @@ const fastify = Fastify({
           return;
         }
 
-        if (pathname === "/chat") {
-          chatWss.handleUpgrade(req, socket, head, (upgraded) => {
-            chatWss.emit("connection", upgraded, req);
-          });
+        /* WFATP CHAT */
+
+        if (
+          pathname === "/chat" ||
+          pathname === "/chat/"
+        ) {
+          chatWss.handleUpgrade(
+            req,
+            socket,
+            head,
+            (ws) => {
+              chatWss.emit(
+                "connection",
+                ws,
+                req
+              );
+            }
+          );
+
           return;
         }
 
-        socket.end();
+        socket.destroy();
       });
   },
 });
+
+/* =========================================================
+   STATIC ROUTES
+   ========================================================= */
 
 fastify.register(fastifyStatic, {
   root: publicPath,
@@ -367,26 +615,53 @@ fastify.register(fastifyStatic, {
   decorateReply: false,
 });
 
-fastify.get("/chat/status", async () => ({
-  ok: true,
-  online: chatClients.size,
-  history: chatHistory.length,
-  dms: true,
-  files: true,
-}));
+/* =========================================================
+   CHAT STATUS
+   ========================================================= */
 
-fastify.setNotFoundHandler((res, reply) =>
-  reply.code(404).type("text/html").sendFile("404.html")
-);
+fastify.get("/chat/status", async () => {
+  return {
+    ok: true,
+    online: chatClients.size,
+    history: chatHistory.length,
+    features: {
+      publicChat: true,
+      directMessages: true,
+      fileSharing: true,
+    },
+  };
+});
+
+/* =========================================================
+   404
+   ========================================================= */
+
+fastify.setNotFoundHandler((request, reply) => {
+  return reply
+    .code(404)
+    .type("text/html")
+    .sendFile("404.html");
+});
+
+/* =========================================================
+   STARTUP
+   ========================================================= */
 
 fastify.server.on("listening", () => {
   const address = fastify.server.address();
 
-  console.log("Listening on:");
-  console.log(`\thttp://localhost:${address.port}`);
-  console.log(`\thttp://${hostname()}:${address.port}`);
+  console.log("WFATP server listening on:");
+
   console.log(
-    `\thttp://${
+    `http://localhost:${address.port}`
+  );
+
+  console.log(
+    `http://${hostname()}:${address.port}`
+  );
+
+  console.log(
+    `http://${
       address.family === "IPv6"
         ? `[${address.address}]`
         : address.address
@@ -394,22 +669,42 @@ fastify.server.on("listening", () => {
   );
 });
 
+/* =========================================================
+   SHUTDOWN
+   ========================================================= */
+
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
 function shutdown() {
-  console.log("SIGTERM signal received: closing HTTP server");
+  console.log("Closing WFATP server...");
+
+  for (const ws of chatClients.keys()) {
+    try {
+      ws.close();
+    } catch {}
+  }
 
   try {
     chatWss.close();
   } catch {}
 
-  fastify.close();
-  process.exit(0);
+  fastify
+    .close()
+    .finally(() => {
+      process.exit(0);
+    });
 }
 
+/* =========================================================
+   LISTEN
+   ========================================================= */
+
 let port = parseInt(process.env.PORT || "");
-if (isNaN(port)) port = 8080;
+
+if (Number.isNaN(port)) {
+  port = 8080;
+}
 
 fastify.listen({
   port,
