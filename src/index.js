@@ -46,6 +46,14 @@ const chatClients = new Map();
 const publicHistory = [];
 const dmHistory = new Map();
 
+// HTTPS fallback for browsers and networks that cannot keep a WebSocket open.
+// Each HTTP visitor has a local WebSocket bridge, so both transports share
+// the same chat room, message validation, rate limits, and DM history.
+const httpSessions = new Map();
+const HTTP_SESSION_TTL = 45000;
+const MAX_HTTP_SESSIONS = 200;
+const MAX_HTTP_QUEUE_BYTES = 4 * 1024 * 1024;
+
 function cleanUserId(value) {
   const id = String(value || "").trim();
   return /^[A-Za-z0-9_-]{8,64}$/.test(id) ? id : "";
@@ -67,7 +75,6 @@ function cleanText(value) {
     .trim()
     .slice(0, CHAT_TEXT_LIMIT);
 
-  // Keep direct contact info out of the public room and DMs.
   text = text.replace(
     /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi,
     "[email removed]"
@@ -232,6 +239,65 @@ function rateLimit(client) {
   return true;
 }
 
+function closeHttpSession(session) {
+  if (!session) return;
+  if (httpSessions.get(session.id) === session) httpSessions.delete(session.id);
+  try { session.ws.close(); } catch {}
+}
+
+function startHttpSession(id) {
+  const previous = httpSessions.get(id);
+  if (previous) closeHttpSession(previous);
+  if (httpSessions.size >= MAX_HTTP_SESSIONS) return null;
+  const address = fastify.server.address();
+  if (!address || !address.port) return null;
+  const session = {
+    id, lastSeen: Date.now(), packets: [], queuedBytes: 0,
+    hello: null, closed: false, onHello: null, ws: null,
+  };
+  httpSessions.set(id, session);
+  const ws = new WebSocket(`ws://127.0.0.1:${address.port}/chat?id=${encodeURIComponent(id)}`);
+  session.ws = ws;
+  ws.on("message", (raw) => {
+    let packet;
+    try { packet = JSON.parse(raw.toString("utf8")); } catch { return; }
+    if (packet.type === "hello" && !session.hello) {
+      session.hello = packet;
+      if (session.onHello) session.onHello(packet);
+      return;
+    }
+    const size = Buffer.byteLength(JSON.stringify(packet));
+    session.packets.push({ packet, size });
+    session.queuedBytes += size;
+    while (session.packets.length > 100 || session.queuedBytes > MAX_HTTP_QUEUE_BYTES) {
+      const removed = session.packets.shift();
+      session.queuedBytes -= removed.size;
+    }
+  });
+  ws.on("close", () => {
+    session.closed = true;
+    if (session.onHello && !session.hello) session.onHello(null);
+    if (httpSessions.get(id) === session) httpSessions.delete(id);
+  });
+  ws.on("error", () => {});
+  return session;
+}
+
+function waitForHttpHello(session) {
+  if (session.hello) return Promise.resolve(session.hello);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => { session.onHello = null; resolve(null); }, 6500);
+    session.onHello = (packet) => { clearTimeout(timer); session.onHello = null; resolve(packet); };
+  });
+}
+
+const httpCleanup = setInterval(() => {
+  for (const session of httpSessions.values()) {
+    if (Date.now() - session.lastSeen > HTTP_SESSION_TTL) closeHttpSession(session);
+  }
+}, 12000);
+httpCleanup.unref();
+
 chatWss.on("connection", (ws, req) => {
   let requestedId = "";
   try {
@@ -363,6 +429,12 @@ const fastify = Fastify({
       .on("request", (req, res) => {
         res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
         res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+        if ((req.url || "").startsWith("/chat/http/")) {
+          res.setHeader("Access-Control-Allow-Origin", "*");
+          res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+          res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+          res.setHeader("Cache-Control", "no-store, max-age=0");
+        }
         handler(req, res);
       })
       .on("upgrade", (req, socket, head) => {
@@ -418,7 +490,54 @@ fastify.get("/chat/status", async () => ({
   dms: true,
   fileSharing: true,
   maxFileBytes: MAX_FILE_BYTES,
+  httpsFallback: true,
 }));
+
+fastify.options("/chat/http/*", async (request, reply) => reply.code(204).send());
+
+fastify.get("/chat/http/connect", async (request, reply) => {
+  const id = cleanUserId(request.query?.id);
+  if (!id) return reply.code(400).send({ ok: false, error: "Invalid chat ID" });
+  const session = startHttpSession(id);
+  if (!session) return reply.code(503).send({ ok: false, error: "Chat is busy" });
+  const hello = await waitForHttpHello(session);
+  if (!hello) {
+    closeHttpSession(session);
+    return reply.code(503).send({ ok: false, error: "Chat server unavailable" });
+  }
+  return { ok: true, hello };
+});
+
+fastify.get("/chat/http/poll", async (request, reply) => {
+  const id = cleanUserId(request.query?.id);
+  const session = id && httpSessions.get(id);
+  if (!session || session.closed || session.ws.readyState !== WebSocket.OPEN) {
+    return reply.code(410).send({ ok: false, error: "Chat session expired" });
+  }
+  session.lastSeen = Date.now();
+  const packets = session.packets.map((row) => row.packet);
+  session.packets = [];
+  session.queuedBytes = 0;
+  return { ok: true, packets };
+});
+
+fastify.post("/chat/http/send", { bodyLimit: MAX_CHAT_PAYLOAD }, async (request, reply) => {
+  const id = cleanUserId(request.query?.id);
+  const session = id && httpSessions.get(id);
+  if (!session || session.closed || session.ws.readyState !== WebSocket.OPEN) {
+    return reply.code(410).send({ ok: false, error: "Chat session expired" });
+  }
+  let packet;
+  try { packet = JSON.parse(String(request.body || "")); }
+  catch { return reply.code(400).send({ ok: false, error: "Invalid message" }); }
+  if (!packet || typeof packet !== "object" || Array.isArray(packet)) {
+    return reply.code(400).send({ ok: false, error: "Invalid message" });
+  }
+  session.lastSeen = Date.now();
+  try { session.ws.send(JSON.stringify(packet)); }
+  catch { return reply.code(503).send({ ok: false, error: "Chat connection closed" }); }
+  return { ok: true };
+});
 
 fastify.setNotFoundHandler((res, reply) => {
   return reply.code(404).type("text/html").sendFile("404.html");
@@ -441,6 +560,8 @@ process.on("SIGTERM", shutdown);
 
 function shutdown() {
   console.log("SIGTERM signal received: closing HTTP server");
+  clearInterval(httpCleanup);
+  for (const session of httpSessions.values()) closeHttpSession(session);
   try {
     chatWss.close();
   } catch {}
