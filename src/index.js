@@ -623,6 +623,18 @@ fastify.post("/chat/http/mod/action", { bodyLimit: 4096 }, async (request, reply
   const session = data && moderation.session(data.token, cleanUserId(data.id));
   if (!session) return reply.code(401).send({ ok: false, error: "Enter your admin code again." });
   const action = String(data.action || "");
+  if (action === "reset_codes") {
+    const result = moderation.resetCodes(session);
+    if (result.error) return reply.code(result.status).send({ ok: false, error: result.error });
+    for (const [socket, client] of chatClients) if (client.role && !moderation.session(client.moderatorToken, client.id)) {
+      client.role = "";
+      client.moderatorToken = "";
+      sendJson(socket, { type: "moderator_role", role: "" });
+    }
+    broadcastPresence();
+    broadcast({ type: "chat_reset", history: visiblePublicHistory() });
+    return { ok: true, reset: true };
+  }
   if (["revoke_admin", "restore_admin", "approve_owner", "deny_owner", "remove_owner"].includes(action)) {
     const targetId = cleanUserId(data.targetId);
     const result = moderation.adminAccess(session, action, targetId, String(data.requestId || ""));

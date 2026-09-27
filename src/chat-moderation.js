@@ -264,6 +264,29 @@ export class ChatModeration {
       newCode, codeKind, approved: action === 'approve_owner' };
   }
 
+  resetCodes(session) {
+    if (!session || session.role !== 'owner' || session.id !== this.primaryOwnerId) {
+      return { error: 'Only the first owner can restore the original codes.', status: 403 };
+    }
+    const previousAdminCode = this.adminCode;
+    const previousOwnerCode = this.ownerCode;
+    const previousRequests = this.ownerRequests;
+    this.adminCode = this.initialAdminCode;
+    this.ownerCode = this.initialOwnerCode;
+    this.ownerRequests = new Map();
+    if (!this.save()) {
+      this.adminCode = previousAdminCode;
+      this.ownerCode = previousOwnerCode;
+      this.ownerRequests = previousRequests;
+      return { error: 'Could not save restored codes. Check the moderation storage.', status: 500 };
+    }
+    // Existing logins for either code must be entered again; keep the owner's current session.
+    for (const [token, entry] of this.tokens) {
+      if (entry.role === 'admin' || (entry.role === 'owner' && entry.id !== session.id)) this.tokens.delete(token);
+    }
+    return { reset: true };
+  }
+
   change(session, action, targetId, minutes = 10) {
     if (!session || !['admin', 'owner'].includes(session.role)) return { error: 'Admin login required.', status: 401 };
     if (!ID_PATTERN.test(targetId)) return { error: 'Select a person.', status: 400 };
