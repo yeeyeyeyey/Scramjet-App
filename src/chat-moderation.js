@@ -20,6 +20,7 @@ export class ChatModeration {
     this.file = file;
     this.clock = clock;
     this.states = new Map();
+    this.revokedAdmins = new Set();
     this.tokens = new Map();
     this.attempts = new Map();
     if (file) {
@@ -34,6 +35,7 @@ export class ChatModeration {
             });
           }
         }
+        for (const id of saved.revokedAdmins || []) if (ID_PATTERN.test(id)) this.revokedAdmins.add(id);
       } catch (error) {
         if (error.code !== 'ENOENT') console.error('Could not load chat moderation state:', error.message);
       }
@@ -48,7 +50,7 @@ export class ChatModeration {
     try {
       mkdirSync(dirname(this.file), { recursive: true });
       const temp = `${this.file}.${process.pid}.tmp`;
-      writeFileSync(temp, JSON.stringify({ users }), { mode: 0o600 });
+      writeFileSync(temp, JSON.stringify({ users, revokedAdmins: [...this.revokedAdmins] }), { mode: 0o600 });
       renameSync(temp, this.file);
     } catch (error) {
       console.error('Could not save chat moderation state:', error.message);
@@ -98,6 +100,9 @@ export class ChatModeration {
       for (const key of [ipKey, userKey]) this.attempts.get(key).push(now);
       return { error: 'Incorrect code.', status: 401 };
     }
+    if (role === 'admin' && this.revokedAdmins.has(id)) {
+      return { error: 'The owner removed admin access for this profile.', status: 403 };
+    }
     this.attempts.delete(userKey);
     const token = randomBytes(32).toString('base64url');
     this.tokens.set(token, { id, role, expires: now + TOKEN_LIFETIME });
@@ -108,15 +113,35 @@ export class ChatModeration {
     const entry = this.tokens.get(String(token || ''));
     if (!entry) return null;
     if (entry.expires <= this.clock()) { this.tokens.delete(token); return null; }
+    if (entry.role === 'admin' && this.revokedAdmins.has(entry.id)) { this.tokens.delete(token); return null; }
     return entry.id === id ? entry : null;
   }
 
-  isModerator(id) {
+  roleFor(id) {
+    let role = '';
     for (const [token, entry] of this.tokens) {
-      if (entry.expires <= this.clock()) this.tokens.delete(token);
-      else if (entry.id === id) return true;
+      if (!this.session(token, entry.id)) continue;
+      if (entry.id === id) role = entry.role === 'owner' ? 'owner' : role || 'admin';
     }
-    return false;
+    return role;
+  }
+
+  isModerator(id) { return !!this.roleFor(id); }
+
+  adminAccess(session, action, targetId) {
+    if (!session || session.role !== 'owner') return { error: 'Only the owner can manage admins.', status: 403 };
+    if (!ID_PATTERN.test(targetId)) return { error: 'Select an admin.', status: 400 };
+    if (targetId === session.id || this.roleFor(targetId) === 'owner') return { error: 'You cannot remove the owner.', status: 403 };
+    if (action === 'revoke_admin') {
+      if (this.roleFor(targetId) !== 'admin') return { error: 'That person is not an admin.', status: 400 };
+      this.revokedAdmins.add(targetId);
+      for (const [token, entry] of this.tokens) if (entry.id === targetId && entry.role === 'admin') this.tokens.delete(token);
+    } else if (action === 'restore_admin') {
+      if (!this.revokedAdmins.has(targetId)) return { error: 'Admin access was not removed.', status: 400 };
+      this.revokedAdmins.delete(targetId);
+    } else return { error: 'Unknown action.', status: 400 };
+    this.save();
+    return { revoked: this.revokedAdmins.has(targetId) };
   }
 
   change(session, action, targetId, minutes = 10) {

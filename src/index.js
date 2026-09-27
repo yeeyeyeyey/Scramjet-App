@@ -184,6 +184,10 @@ function broadcastPresence() {
   broadcast({ type: "presence", online: users.length, users });
 }
 
+function visiblePublicHistory() {
+  return publicHistory.map(message => ({ ...message, role: moderation.roleFor(message.id) }));
+}
+
 function socketsForUser(userId) {
   const out = [];
   for (const [ws, client] of chatClients.entries()) {
@@ -199,6 +203,9 @@ function sendModerationState(userId) {
 
 function moderationList() {
   const users = new Map(uniqueOnlineUsers().map(user => [user.id, user]));
+  for (const entry of moderation.tokens.values()) if (!users.has(entry.id)) users.set(entry.id, {
+    id: entry.id, name: `Guest-${entry.id.slice(0, 4)}`, role: entry.role, online: false,
+  });
   for (const message of [...publicHistory, ...deletedPublicMessages.values()]) {
     if (!users.has(message.id)) users.set(message.id, {
       id: message.id, name: message.name, role: "", online: false,
@@ -206,16 +213,18 @@ function moderationList() {
   }
   const states = moderation.allStates();
   for (const id of Object.keys(states)) if (!users.has(id)) users.set(id, { id, name: `Guest-${id.slice(0, 4)}`, role: "", online: false });
+  for (const id of moderation.revokedAdmins) if (!users.has(id)) users.set(id, { id, name: `Guest-${id.slice(0, 4)}`, role: "", online: false });
   return {
     users: Array.from(users.values()).map(user => ({
-      id: user.id, name: user.name, role: user.role || "",
+      id: user.id, name: user.name, role: moderation.roleFor(user.id),
       online: socketsForUser(user.id).length > 0,
       state: states[user.id] || moderation.stateFor(user.id),
+      revokedAdmin: moderation.revokedAdmins.has(user.id),
     })),
     messages: [
       ...publicHistory.map(message => ({ ...message, deleted: false })),
       ...[...deletedPublicMessages.values()].map(message => ({ ...message, deleted: true })),
-    ].sort((a, b) => b.time - a.time).slice(0, 60).map(message => ({
+    ].sort((a, b) => b.time - a.time).slice(0, CHAT_HISTORY_LIMIT * 2).map(message => ({
       messageId: message.messageId, id: message.id, name: message.name,
       text: String(message.text || (message.attachment ? '[Attachment]' : '')).slice(0, 120),
       time: message.time, deleted: message.deleted,
@@ -367,7 +376,7 @@ chatWss.on("connection", (ws, req) => {
   sendJson(ws, {
     type: "hello",
     id: client.id,
-    history: publicHistory,
+    history: visiblePublicHistory(),
     online: users.length,
     users,
     limits: { fileBytes: MAX_FILE_BYTES },
@@ -602,6 +611,21 @@ fastify.post("/chat/http/mod/action", { bodyLimit: 4096 }, async (request, reply
   const session = data && moderation.session(data.token, cleanUserId(data.id));
   if (!session) return reply.code(401).send({ ok: false, error: "Enter your admin code again." });
   const action = String(data.action || "");
+  if (action === "revoke_admin" || action === "restore_admin") {
+    const targetId = cleanUserId(data.targetId);
+    const result = moderation.adminAccess(session, action, targetId);
+    if (result.error) return reply.code(result.status).send({ ok: false, error: result.error });
+    if (result.revoked) {
+      for (const [socket, client] of chatClients) if (client.id === targetId) {
+        client.role = "";
+        client.moderatorToken = "";
+        sendJson(socket, { type: "moderator_role", role: "" });
+      }
+    }
+    broadcastPresence();
+    broadcast({ type: "chat_reset", history: visiblePublicHistory() });
+    return { ok: true, revoked: result.revoked };
+  }
   const userActions = new Set(["ban", "unban", "warn", "unwarn", "timeout", "untimeout"]);
   if (userActions.has(action)) {
     const targetId = cleanUserId(data.targetId);
@@ -615,6 +639,10 @@ fastify.post("/chat/http/mod/action", { bodyLimit: 4096 }, async (request, reply
   if (action === "delete_message") {
     const index = publicHistory.findIndex(message => message.messageId === messageId);
     if (index < 0) return reply.code(404).send({ ok: false, error: "Message no longer found." });
+    const senderRole = moderation.roleFor(publicHistory[index].id);
+    if (senderRole === "owner" || (senderRole === "admin" && session.role !== "owner")) {
+      return reply.code(403).send({ ok: false, error: "Only the owner can remove moderator messages." });
+    }
     const [message] = publicHistory.splice(index, 1);
     deletedPublicMessages.set(messageId, message);
     while (deletedPublicMessages.size > CHAT_HISTORY_LIMIT) deletedPublicMessages.delete(deletedPublicMessages.keys().next().value);
@@ -629,7 +657,7 @@ fastify.post("/chat/http/mod/action", { bodyLimit: 4096 }, async (request, reply
       publicHistory.push(message);
       publicHistory.sort((a, b) => a.time - b.time);
       while (publicHistory.length > CHAT_HISTORY_LIMIT) publicHistory.shift();
-      broadcast({ type: "chat_reset", history: publicHistory });
+      broadcast({ type: "chat_reset", history: visiblePublicHistory() });
     }
     return { ok: true };
   }
@@ -645,7 +673,7 @@ fastify.post("/chat/http/mod/action", { bodyLimit: 4096 }, async (request, reply
     publicHistory.sort((a, b) => a.time - b.time);
     while (publicHistory.length > CHAT_HISTORY_LIMIT) publicHistory.shift();
     lastClearedPublicHistory = null;
-    broadcast({ type: "chat_reset", history: publicHistory });
+    broadcast({ type: "chat_reset", history: visiblePublicHistory() });
     return { ok: true };
   }
   return reply.code(400).send({ ok: false, error: "Unknown action." });
