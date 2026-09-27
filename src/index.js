@@ -10,6 +10,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { scramjetPath } from "@mercuryworkshop/scramjet/path";
 import { libcurlPath } from "@mercuryworkshop/libcurl-transport";
 import { baremuxPath } from "@mercuryworkshop/bare-mux/node";
+import { ChatModeration } from "./chat-moderation.js";
 
 const publicPath = fileURLToPath(new URL("../public/", import.meta.url));
 
@@ -45,10 +46,16 @@ const chatWss = new WebSocketServer({ noServer: true, maxPayload: MAX_CHAT_PAYLO
 const chatClients = new Map();
 const publicHistory = [];
 const dmHistory = new Map();
-
+const moderation = new ChatModeration({
+  adminCode: process.env.CHAT_ADMIN_CODE,
+  ownerCode: process.env.CHAT_OWNER_CODE,
+  file: process.env.CHAT_MODERATION_FILE || "",
+});
+const deletedPublicMessages = new Map();
+let lastClearedPublicHistory = null;
 // HTTPS fallback for browsers and networks that cannot keep a WebSocket open.
 // Each HTTP visitor has a local WebSocket bridge, so both transports share
-// the same chat room, message validation, rate limits, and DM history.
+// exactly the same chat room, message validation, rate limits, and DM history.
 const httpSessions = new Map();
 const HTTP_SESSION_TTL = 45000;
 const MAX_HTTP_SESSIONS = 200;
@@ -75,6 +82,7 @@ function cleanText(value) {
     .trim()
     .slice(0, CHAT_TEXT_LIMIT);
 
+  // Keep direct contact info out of the public room and DMs.
   text = text.replace(
     /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi,
     "[email removed]"
@@ -141,11 +149,18 @@ function sendJson(ws, packet) {
 
 function uniqueOnlineUsers() {
   const users = new Map();
-  for (const client of chatClients.values()) {
+  for (const [ws, client] of chatClients.entries()) {
+    if (client.role && !moderation.session(client.moderatorToken, client.id)) {
+      client.role = "";
+      client.moderatorToken = "";
+      sendJson(ws, { type: "moderator_role", role: "" });
+    }
+    if (users.has(client.id) && users.get(client.id).role && !client.role) continue;
     users.set(client.id, {
       id: client.id,
       name: client.name,
       avatar: client.avatar,
+      role: client.role || "",
     });
   }
   return Array.from(users.values()).sort((a, b) =>
@@ -175,6 +190,38 @@ function socketsForUser(userId) {
     if (client.id === userId && ws.readyState === WebSocket.OPEN) out.push(ws);
   }
   return out;
+}
+
+function sendModerationState(userId) {
+  const packet = { type: "moderation_state", state: moderation.stateFor(userId) };
+  for (const socket of socketsForUser(userId)) sendJson(socket, packet);
+}
+
+function moderationList() {
+  const users = new Map(uniqueOnlineUsers().map(user => [user.id, user]));
+  for (const message of [...publicHistory, ...deletedPublicMessages.values()]) {
+    if (!users.has(message.id)) users.set(message.id, {
+      id: message.id, name: message.name, role: "", online: false,
+    });
+  }
+  const states = moderation.allStates();
+  for (const id of Object.keys(states)) if (!users.has(id)) users.set(id, { id, name: `Guest-${id.slice(0, 4)}`, role: "", online: false });
+  return {
+    users: Array.from(users.values()).map(user => ({
+      id: user.id, name: user.name, role: user.role || "",
+      online: socketsForUser(user.id).length > 0,
+      state: states[user.id] || moderation.stateFor(user.id),
+    })),
+    messages: [
+      ...publicHistory.map(message => ({ ...message, deleted: false })),
+      ...[...deletedPublicMessages.values()].map(message => ({ ...message, deleted: true })),
+    ].sort((a, b) => b.time - a.time).slice(0, 60).map(message => ({
+      messageId: message.messageId, id: message.id, name: message.name,
+      text: String(message.text || (message.attachment ? '[Attachment]' : '')).slice(0, 120),
+      time: message.time, deleted: message.deleted,
+    })),
+    canRestoreChat: !!lastClearedPublicHistory,
+  };
 }
 
 function dmKey(a, b) {
@@ -309,6 +356,8 @@ chatWss.on("connection", (ws, req) => {
     id: requestedId || randomUUID().replace(/-/g, ""),
     name: "Guest",
     avatar: "",
+    role: "",
+    moderatorToken: "",
     lastMessageAt: 0,
     recentMessages: [],
   };
@@ -322,6 +371,7 @@ chatWss.on("connection", (ws, req) => {
     online: users.length,
     users,
     limits: { fileBytes: MAX_FILE_BYTES },
+    moderation: moderation.stateFor(client.id),
   });
   broadcastPresence();
 
@@ -335,6 +385,15 @@ chatWss.on("connection", (ws, req) => {
       return;
     }
     if (!packet || typeof packet !== "object") return;
+
+    if (packet.type === "moderator_resume") {
+      const session = moderation.session(packet.token, client.id);
+      client.role = session ? session.role : "";
+      client.moderatorToken = session ? String(packet.token) : "";
+      sendJson(ws, { type: "moderator_role", role: client.role });
+      broadcastPresence();
+      return;
+    }
 
     if (packet.type === "profile") {
       client.name = cleanName(packet.name);
@@ -357,6 +416,17 @@ chatWss.on("connection", (ws, req) => {
     }
 
     if (packet.type !== "message" && packet.type !== "dm") return;
+    if (client.role && !moderation.session(client.moderatorToken, client.id)) {
+      client.role = "";
+      client.moderatorToken = "";
+      sendJson(ws, { type: "moderator_role", role: "" });
+      broadcastPresence();
+    }
+    if (moderation.isRestricted(client.id)) {
+      sendModerationState(client.id);
+      sendJson(ws, { type: "error", message: "You cannot send messages while banned or timed out." });
+      return;
+    }
     if (!rateLimit(client)) {
       sendJson(ws, { type: "error", message: "You're sending messages too quickly." });
       return;
@@ -373,6 +443,7 @@ chatWss.on("connection", (ws, req) => {
         id: client.id,
         name: client.name,
         avatar: client.avatar,
+        role: client.role,
         text,
         attachment,
         time: Date.now(),
@@ -401,6 +472,7 @@ chatWss.on("connection", (ws, req) => {
       to,
       name: client.name,
       avatar: client.avatar,
+      role: client.role,
       text,
       attachment,
       time: Date.now(),
@@ -430,6 +502,7 @@ const fastify = Fastify({
         res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
         res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
         if ((req.url || "").startsWith("/chat/http/")) {
+          // Public chat uses no cookies; text/plain POSTs avoid iPad preflights.
           res.setHeader("Access-Control-Allow-Origin", "*");
           res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
           res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -491,9 +564,92 @@ fastify.get("/chat/status", async () => ({
   fileSharing: true,
   maxFileBytes: MAX_FILE_BYTES,
   httpsFallback: true,
+  moderation: moderation.enabled,
 }));
 
 fastify.options("/chat/http/*", async (request, reply) => reply.code(204).send());
+
+function moderatorBody(request) {
+  try {
+    const data = JSON.parse(String(request.body || ""));
+    return data && typeof data === "object" && !Array.isArray(data) ? data : null;
+  } catch { return null; }
+}
+
+fastify.post("/chat/http/mod/login", { bodyLimit: 2048 }, async (request, reply) => {
+  const data = moderatorBody(request);
+  if (!data) return reply.code(400).send({ ok: false, error: "Invalid request." });
+  const result = moderation.login(cleanUserId(data.id), data.code, request.ip);
+  if (result.error) return reply.code(result.status).send({ ok: false, error: result.error });
+  return { ok: true, role: result.role, token: result.token };
+});
+
+fastify.post("/chat/http/mod/list", { bodyLimit: 2048 }, async (request, reply) => {
+  const data = moderatorBody(request);
+  const session = data && moderation.session(data.token, cleanUserId(data.id));
+  if (!session) return reply.code(401).send({ ok: false, error: "Enter your admin code again." });
+  return { ok: true, ...moderationList() };
+});
+
+fastify.post("/chat/http/mod/logout", { bodyLimit: 2048 }, async (request, reply) => {
+  const data = moderatorBody(request);
+  if (data) moderation.tokens.delete(String(data.token || ""));
+  return { ok: true };
+});
+
+fastify.post("/chat/http/mod/action", { bodyLimit: 4096 }, async (request, reply) => {
+  const data = moderatorBody(request);
+  const session = data && moderation.session(data.token, cleanUserId(data.id));
+  if (!session) return reply.code(401).send({ ok: false, error: "Enter your admin code again." });
+  const action = String(data.action || "");
+  const userActions = new Set(["ban", "unban", "warn", "unwarn", "timeout", "untimeout"]);
+  if (userActions.has(action)) {
+    const targetId = cleanUserId(data.targetId);
+    const result = moderation.change(session, action, targetId, data.minutes);
+    if (result.error) return reply.code(result.status).send({ ok: false, error: result.error });
+    sendModerationState(targetId);
+    return { ok: true, state: result.state };
+  }
+
+  const messageId = String(data.messageId || "");
+  if (action === "delete_message") {
+    const index = publicHistory.findIndex(message => message.messageId === messageId);
+    if (index < 0) return reply.code(404).send({ ok: false, error: "Message no longer found." });
+    const [message] = publicHistory.splice(index, 1);
+    deletedPublicMessages.set(messageId, message);
+    while (deletedPublicMessages.size > CHAT_HISTORY_LIMIT) deletedPublicMessages.delete(deletedPublicMessages.keys().next().value);
+    broadcast({ type: "chat_deleted", messageId });
+    return { ok: true };
+  }
+  if (action === "restore_message") {
+    const message = deletedPublicMessages.get(messageId);
+    if (!message) return reply.code(404).send({ ok: false, error: "Deleted message no longer available." });
+    deletedPublicMessages.delete(messageId);
+    if (!publicHistory.some(row => row.messageId === messageId)) {
+      publicHistory.push(message);
+      publicHistory.sort((a, b) => a.time - b.time);
+      while (publicHistory.length > CHAT_HISTORY_LIMIT) publicHistory.shift();
+      broadcast({ type: "chat_reset", history: publicHistory });
+    }
+    return { ok: true };
+  }
+  if (action === "clear_chat") {
+    lastClearedPublicHistory = publicHistory.splice(0);
+    broadcast({ type: "chat_cleared" });
+    return { ok: true };
+  }
+  if (action === "restore_chat") {
+    if (!lastClearedPublicHistory) return reply.code(404).send({ ok: false, error: "No chat deletion to undo." });
+    const seen = new Set(publicHistory.map(row => row.messageId));
+    for (const message of lastClearedPublicHistory) if (!seen.has(message.messageId)) publicHistory.push(message);
+    publicHistory.sort((a, b) => a.time - b.time);
+    while (publicHistory.length > CHAT_HISTORY_LIMIT) publicHistory.shift();
+    lastClearedPublicHistory = null;
+    broadcast({ type: "chat_reset", history: publicHistory });
+    return { ok: true };
+  }
+  return reply.code(400).send({ ok: false, error: "Unknown action." });
+});
 
 fastify.get("/chat/http/connect", async (request, reply) => {
   const id = cleanUserId(request.query?.id);
