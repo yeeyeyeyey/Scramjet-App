@@ -201,7 +201,7 @@ function sendModerationState(userId) {
   for (const socket of socketsForUser(userId)) sendJson(socket, packet);
 }
 
-function moderationList() {
+function moderationList(session) {
   const users = new Map(uniqueOnlineUsers().map(user => [user.id, user]));
   for (const entry of moderation.tokens.values()) if (!users.has(entry.id)) users.set(entry.id, {
     id: entry.id, name: `Guest-${entry.id.slice(0, 4)}`, role: entry.role, online: false,
@@ -214,13 +214,17 @@ function moderationList() {
   const states = moderation.allStates();
   for (const id of Object.keys(states)) if (!users.has(id)) users.set(id, { id, name: `Guest-${id.slice(0, 4)}`, role: "", online: false });
   for (const id of moderation.revokedAdmins) if (!users.has(id)) users.set(id, { id, name: `Guest-${id.slice(0, 4)}`, role: "", online: false });
+  for (const id of moderation.ownerDevices.keys()) if (!users.has(id)) users.set(id, { id, name: `Guest-${id.slice(0, 4)}`, role: "", online: false });
   return {
     users: Array.from(users.values()).map(user => ({
       id: user.id, name: user.name, role: moderation.roleFor(user.id),
       online: socketsForUser(user.id).length > 0,
       state: states[user.id] || moderation.stateFor(user.id),
       revokedAdmin: moderation.revokedAdmins.has(user.id),
+      approvedOwner: moderation.ownerDevices.has(user.id),
     })),
+    primaryOwner: session.id === moderation.primaryOwnerId && session.role === "owner",
+    ownerRequests: session.id === moderation.primaryOwnerId && session.role === "owner" ? moderation.pendingOwners() : [],
     messages: [
       ...publicHistory.map(message => ({ ...message, deleted: false })),
       ...[...deletedPublicMessages.values()].map(message => ({ ...message, deleted: true })),
@@ -588,16 +592,24 @@ function moderatorBody(request) {
 fastify.post("/chat/http/mod/login", { bodyLimit: 2048 }, async (request, reply) => {
   const data = moderatorBody(request);
   if (!data) return reply.code(400).send({ ok: false, error: "Invalid request." });
-  const result = moderation.login(cleanUserId(data.id), data.code, request.ip);
+  const result = moderation.login(cleanUserId(data.id), data.code, request.ip, data.deviceKey, cleanName(data.name));
   if (result.error) return reply.code(result.status).send({ ok: false, error: result.error });
-  return { ok: true, role: result.role, token: result.token };
+  return { ok: true, ...result };
+});
+
+fastify.post("/chat/http/mod/owner-request", { bodyLimit: 2048 }, async (request, reply) => {
+  const data = moderatorBody(request);
+  if (!data) return reply.code(400).send({ ok: false, error: "Invalid request." });
+  const result = moderation.ownerRequestStatus(cleanUserId(data.id), data.requestId, data.requestToken);
+  if (result.error) return reply.code(result.status).send({ ok: false, error: result.error });
+  return { ok: true, ...result };
 });
 
 fastify.post("/chat/http/mod/list", { bodyLimit: 2048 }, async (request, reply) => {
   const data = moderatorBody(request);
   const session = data && moderation.session(data.token, cleanUserId(data.id));
   if (!session) return reply.code(401).send({ ok: false, error: "Enter your admin code again." });
-  return { ok: true, ...moderationList() };
+  return { ok: true, ...moderationList(session) };
 });
 
 fastify.post("/chat/http/mod/logout", { bodyLimit: 2048 }, async (request, reply) => {
@@ -611,12 +623,12 @@ fastify.post("/chat/http/mod/action", { bodyLimit: 4096 }, async (request, reply
   const session = data && moderation.session(data.token, cleanUserId(data.id));
   if (!session) return reply.code(401).send({ ok: false, error: "Enter your admin code again." });
   const action = String(data.action || "");
-  if (action === "revoke_admin" || action === "restore_admin") {
+  if (["revoke_admin", "restore_admin", "approve_owner", "deny_owner", "remove_owner"].includes(action)) {
     const targetId = cleanUserId(data.targetId);
-    const result = moderation.adminAccess(session, action, targetId);
+    const result = moderation.adminAccess(session, action, targetId, String(data.requestId || ""));
     if (result.error) return reply.code(result.status).send({ ok: false, error: result.error });
-    if (result.revoked) {
-      for (const [socket, client] of chatClients) if (client.id === targetId) {
+    if (result.newCode) {
+      for (const [socket, client] of chatClients) if (client.role && !moderation.session(client.moderatorToken, client.id)) {
         client.role = "";
         client.moderatorToken = "";
         sendJson(socket, { type: "moderator_role", role: "" });
@@ -624,7 +636,8 @@ fastify.post("/chat/http/mod/action", { bodyLimit: 4096 }, async (request, reply
     }
     broadcastPresence();
     broadcast({ type: "chat_reset", history: visiblePublicHistory() });
-    return { ok: true, revoked: result.revoked };
+    return { ok: true, revoked: result.revoked, removedOwner: result.removedOwner,
+      newCode: result.newCode, codeKind: result.codeKind, approved: result.approved };
   }
   const userActions = new Set(["ban", "unban", "warn", "unwarn", "timeout", "untimeout"]);
   if (userActions.has(action)) {
