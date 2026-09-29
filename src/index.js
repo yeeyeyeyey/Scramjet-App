@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "url";
+import { dirname, join } from "node:path";
 import { hostname } from "node:os";
 import { server as wisp, logging } from "@mercuryworkshop/wisp-js/server";
 import Fastify from "fastify";
@@ -11,6 +12,7 @@ import { scramjetPath } from "@mercuryworkshop/scramjet/path";
 import { libcurlPath } from "@mercuryworkshop/libcurl-transport";
 import { baremuxPath } from "@mercuryworkshop/bare-mux/node";
 import { ChatModeration } from "./chat-moderation.js";
+import { ChatFeedback } from "./chat-feedback.js";
 
 const publicPath = fileURLToPath(new URL("../public/", import.meta.url));
 
@@ -51,6 +53,9 @@ const moderation = new ChatModeration({
   ownerCode: process.env.CHAT_OWNER_CODE,
   file: process.env.CHAT_MODERATION_FILE || "",
 });
+const feedbackFile = process.env.CHAT_TICKETS_FILE || (process.env.CHAT_MODERATION_FILE
+  ? join(dirname(process.env.CHAT_MODERATION_FILE), "chat-tickets.json") : "");
+const feedback = new ChatFeedback({ file: feedbackFile });
 const deletedPublicMessages = new Map();
 let lastClearedPublicHistory = null;
 // HTTPS fallback for browsers and networks that cannot keep a WebSocket open.
@@ -199,6 +204,24 @@ function socketsForUser(userId) {
 function sendModerationState(userId) {
   const packet = { type: "moderation_state", state: moderation.stateFor(userId) };
   for (const socket of socketsForUser(userId)) sendJson(socket, packet);
+}
+
+function feedbackStaff(client) {
+  const session = moderation.session(client.moderatorToken, client.id);
+  return !!session && (session.role === "admin" || session.role === "owner");
+}
+
+function sendFeedbackList(ws, client) {
+  sendJson(ws, { type: "feedback_list", tickets: feedback.list(client.id, feedbackStaff(client), client.ticketKeys) });
+}
+
+function notifyFeedback(ticket) {
+  for (const [socket, client] of chatClients) {
+    const staff = feedbackStaff(client);
+    const visibleTicket = feedback.get(client.id, staff, ticket.id, client.ticketKeys.get(ticket.id));
+    if (visibleTicket) sendJson(socket, { type: "feedback_ticket", ticket: visibleTicket });
+    sendFeedbackList(socket, client);
+  }
 }
 
 function moderationList(session) {
@@ -371,6 +394,7 @@ chatWss.on("connection", (ws, req) => {
     avatar: "",
     role: "",
     moderatorToken: "",
+    ticketKeys: new Map(),
     lastMessageAt: 0,
     recentMessages: [],
   };
@@ -385,7 +409,9 @@ chatWss.on("connection", (ws, req) => {
     users,
     limits: { fileBytes: MAX_FILE_BYTES },
     moderation: moderation.stateFor(client.id),
+    feedbackTickets: true,
   });
+  sendFeedbackList(ws, client);
   broadcastPresence();
 
   ws.on("message", (raw, isBinary) => {
@@ -404,6 +430,7 @@ chatWss.on("connection", (ws, req) => {
       client.role = session ? session.role : "";
       client.moderatorToken = session ? String(packet.token) : "";
       sendJson(ws, { type: "moderator_role", role: client.role });
+      sendFeedbackList(ws, client);
       broadcastPresence();
       return;
     }
@@ -425,6 +452,54 @@ chatWss.on("connection", (ws, req) => {
         with: other,
         messages: row ? row.messages : [],
       });
+      return;
+    }
+
+    if (typeof packet.type === "string" && packet.type.startsWith("feedback_")) {
+      const staff = feedbackStaff(client);
+      if (packet.type === "feedback_list_request") {
+        if (Array.isArray(packet.keys)) for (const entry of packet.keys.slice(0, 50)) {
+          if (!entry || typeof entry.id !== "string" || typeof entry.key !== "string") continue;
+          if (feedback.get(client.id, false, entry.id, entry.key)) client.ticketKeys.set(entry.id, entry.key);
+        }
+        sendFeedbackList(ws, client);
+        return;
+      }
+      const ticketId = String(packet.ticketId || "");
+      const accessKey = client.ticketKeys.get(ticketId) || (typeof packet.accessKey === "string" ? packet.accessKey : "");
+      if (accessKey && !client.ticketKeys.has(ticketId) && feedback.get(client.id, false, ticketId, accessKey)) {
+        client.ticketKeys.set(ticketId, accessKey);
+      }
+      if (packet.type === "feedback_open") {
+        const ticket = feedback.get(client.id, staff, ticketId, accessKey);
+        sendJson(ws, ticket ? { type: "feedback_ticket", ticket } : { type: "feedback_error", message: "Ticket not found." });
+        return;
+      }
+      if (!["feedback_create", "feedback_reply", "feedback_status"].includes(packet.type)) return;
+      if (moderation.isRestricted(client.id)) {
+        sendJson(ws, { type: "feedback_error", message: "Tickets are unavailable while banned or timed out." });
+        return;
+      }
+      if (!rateLimit(client)) {
+        sendJson(ws, { type: "feedback_error", message: "Please wait before sending another ticket update." });
+        return;
+      }
+      let result;
+      if (packet.type === "feedback_create") {
+        result = feedback.create(client.id, client.name, cleanText(packet.subject).slice(0, 80), cleanText(packet.text));
+      } else if (packet.type === "feedback_reply") {
+        result = feedback.reply(client.id, client.name, staff, ticketId, cleanText(packet.text), accessKey);
+      } else {
+        result = feedback.setStatus(client.id, staff, ticketId, String(packet.status || ""), accessKey);
+      }
+      const requestId = String(packet.requestId || "").slice(0, 80);
+      if (result.error) sendJson(ws, { type: "feedback_error", requestId, message: result.error });
+      else {
+        if (result.accessKey) client.ticketKeys.set(result.ticket.id, result.accessKey);
+        notifyFeedback(result.ticket);
+        sendJson(ws, { type: "feedback_ack", requestId, action: packet.type, ticketId: result.ticket.id,
+          ...(result.accessKey ? { accessKey: result.accessKey } : {}) });
+      }
       return;
     }
 
@@ -578,6 +653,8 @@ fastify.get("/chat/status", async () => ({
   maxFileBytes: MAX_FILE_BYTES,
   httpsFallback: true,
   moderation: moderation.enabled,
+  feedbackTickets: true,
+  feedbackPersistent: !!feedbackFile,
 }));
 
 fastify.options("/chat/http/*", async (request, reply) => reply.code(204).send());
